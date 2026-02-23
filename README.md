@@ -1,4 +1,5 @@
 # ClrOxide
+
 `ClrOxide` is a rust library that allows you to host the CLR and dynamically execute dotnet binaries.
 
 I wanted to call it `Kepler` for no particular reason, but there's already a package named `kepler` in cargo. :(
@@ -161,3 +162,124 @@ fn main() -> Result<(), String> {
 You can use the building blocks provided by `ClrOxide` to patch `System.Environment.Exit` as described in [Massaging your CLR: Preventing Environment.Exit in In-Process .NET Assemblies](https://www.mdsec.co.uk/2020/08/massaging-your-clr-preventing-environment-exit-in-in-process-net-assemblies) by MDSec.  
 
 You can check the reference implementation at [`examples/patch_exit.rs`](examples/patch_exit.rs). Since this requires using `VirtualProtect` or `NtProtectVirtualMemory`, I don't intend to add this as a feature to `ClrOxide`. 
+
+---
+
+## AMSI Bypass via CLR Hosting
+
+This fork implements an AMSI bypass technique based on CLR customization, as described in [Being a Good CLR Host](https://github.com/xforcered/Being-A-Good-CLR-Host).
+
+### How it works
+
+Traditionally, `Load_3` (which takes a byte array) is used to load .NET assemblies reflectively - and AMSI scans those bytes. By using `Load_2` (which takes an assembly identity string) combined with a custom `IHostAssemblyStore`, we can load assemblies from memory without AMSI ever seeing the bytes.
+
+```
+┌─────────────────────┐
+│  ICLRRuntimeHost    │  ← SetHostControl() BEFORE Start()
+│  SetHostControl()   │
+└─────────┬───────────┘
+          │
+          ▼
+┌─────────────────────┐
+│    IHostControl     │  ← Our implementation
+│  GetHostManager()   │
+└─────────┬───────────┘
+          │ returns IHostAssemblyManager
+          ▼
+┌─────────────────────────┐
+│  IHostAssemblyManager   │  ← Our implementation
+│  GetAssemblyStore()     │
+└─────────┬───────────────┘
+          │ returns IHostAssemblyStore
+          ▼
+┌─────────────────────────┐
+│  IHostAssemblyStore     │  ← The magic happens here!
+│  ProvideAssembly()      │  → Returns IStream with in-memory bytes
+└─────────────────────────┘
+```
+
+When `Load_2("MyAssembly, Version=1.0.0.0, ...")` is called:
+1. The CLR calls our `ProvideAssembly` with the assembly identity
+2. We return an `IStream` containing the assembly bytes from memory
+3. The CLR loads the assembly thinking it came from disk
+4. **AMSI never scans the bytes** because `Load_2` is not instrumented!
+
+### New files
+
+| File | Description |
+|------|-------------|
+| `primitives/iclrruntimehost.rs` | `ICLRRuntimeHost` with `SetHostControl` |
+| `primitives/ihostassemblystore.rs` | `IHostControl`, `IHostAssemblyManager`, `IHostAssemblyStore`, `MemoryStream`, `AmsiBypassLoader` |
+| `primitives/iclrassemblyidentitymanager.rs` | Extract assembly identity from bytes |
+
+### New methods in `Clr`
+
+| Method | Description |
+|--------|-------------|
+| `get_context_with_amsi_bypass()` | Initialize CLR with AMSI bypass enabled |
+| `run_with_amsi_bypass()` | Run with explicit identity string |
+| `run_with_amsi_bypass_no_redirect()` | Same without output redirection |
+| `run_with_amsi_bypass_auto()` | **Recommended** - Auto-extracts identity from bytes |
+| `run_with_amsi_bypass_auto_no_redirect()` | Same without output redirection |
+| `get_assembly_identity()` | Get identity string from assembly bytes |
+
+### Usage - Recommended (Auto Identity)
+
+```rust
+use clroxide::clr::Clr;
+use clroxide::primitives::AmsiBypassLoader;
+
+fn main() -> Result<(), String> {
+    let assembly_bytes = std::fs::read("Seatbelt.exe").unwrap();
+    let args = vec!["--all".to_string()];
+
+    let mut bypass_loader = AmsiBypassLoader::new();
+    let mut clr = Clr::new(assembly_bytes, args)?;
+
+    // Automatically extracts the correct assembly identity
+    let output = clr.run_with_amsi_bypass_auto(&mut bypass_loader)?;
+
+    println!("{}", output);
+    Ok(())
+}
+```
+
+### Usage - Manual Identity
+
+If you already know the assembly identity (e.g., extracted on client/teamserver side):
+
+```rust
+use clroxide::clr::Clr;
+use clroxide::primitives::AmsiBypassLoader;
+
+fn main() -> Result<(), String> {
+    let assembly_bytes = std::fs::read("Seatbelt.exe").unwrap();
+    let args = vec!["--all".to_string()];
+
+    let mut bypass_loader = AmsiBypassLoader::new();
+    let mut clr = Clr::new(assembly_bytes, args)?;
+
+    // Identity MUST match the actual assembly!
+    let identity = "Seatbelt, Version=1.0.0.0, Culture=neutral, PublicKeyToken=null";
+    let output = clr.run_with_amsi_bypass(&mut bypass_loader, identity)?;
+
+    println!("{}", output);
+    Ok(())
+}
+```
+
+### Important: Identity Must Match!
+
+> **Warning**: The assembly identity passed to `Load_2` **MUST** match the actual identity of the assembly you return from `ProvideAssembly`. The CLR verifies this and will throw an error if they don't match.
+
+Use `run_with_amsi_bypass_auto()` to automatically extract the correct identity, or use `get_assembly_identity()` to extract it manually:
+
+```rust
+let identity = clr.get_assembly_identity()?;
+// Returns: "Seatbelt, Version=1.0.0.0, Culture=neutral, PublicKeyToken=null"
+```
+
+### References
+
+- [Being-A-Good-CLR-Host](https://github.com/xforcered/Being-A-Good-CLR-Host) - Original C implementation
+- [Customizing the Microsoft .NET Framework Common Language Runtime](https://www.amazon.com/Customizing-Microsoft-Framework-Common-Language/dp/0735619883) by Steven Pratschner
