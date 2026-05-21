@@ -1,4 +1,4 @@
-ClrOxide — AMSI Bypass Fork
+# ClrOxide — AMSI Bypass Fork
 
 This is a fork of [yamakadi/clroxide](https://github.com/yamakadi/clroxide), a Rust library for hosting the CLR and running .NET assemblies in-process. On top of everything the original does, this fork adds an AMSI bypass technique based on CLR host customization — specifically, intercepting assembly loading through `IHostAssemblyStore` so that AMSI never gets a chance to scan the bytes.
 
